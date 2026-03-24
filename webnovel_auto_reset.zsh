@@ -37,6 +37,8 @@ STOP_FILE="/tmp/webnovel_auto_reset.${WRAPPER_PID}.stop"
 PROJECT_ROOT="$PWD"
 PROJECT_STATE_FILE="${PROJECT_ROOT}/.webnovel/state.json"
 MAX_SUCCESS_CYCLES="${1:-}"
+LOG_FILE="/tmp/webnovel_auto_reset.${WRAPPER_PID}.log"
+SCRIPT_TTY="$(tty 2>/dev/null || true)"
 
 POLL_INTERVAL_SECONDS="${WEBNOVEL_AUTO_RESET_POLL_INTERVAL_SECONDS:-2}"
 COOLDOWN_SECONDS="${WEBNOVEL_AUTO_RESET_COOLDOWN_SECONDS:-60}"
@@ -60,7 +62,11 @@ CURRENT_AUTOTYPE_PID=""
 CURRENT_AUTOTYPE_STATUS_FILE=""
 
 log() {
-  print -r -- "$*"
+  local message="$*"
+  local timestamp=""
+  print -r -- "$message"
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+  print -r -- "[${timestamp}] [wrapper] ${message}" >> "$LOG_FILE"
 }
 
 is_alive() {
@@ -133,20 +139,22 @@ cleanup_round() {
 }
 
 capture_terminal_target() {
-  osascript <<'EOF'
+  [[ -n "$SCRIPT_TTY" ]] || return 1
+
+  TARGET_TTY_VALUE="$SCRIPT_TTY" osascript <<'EOF'
+set targetTty to system attribute "TARGET_TTY_VALUE"
 tell application "Terminal"
-  set targetWindow to front window
-  set targetWindowId to id of targetWindow
-  set selectedTabRef to selected tab of targetWindow
-  set targetTabIndex to 1
-  repeat with i from 1 to (count tabs of targetWindow)
-    if contents of tab i of targetWindow is contents of selectedTabRef then
-      set targetTabIndex to i
-      exit repeat
-    end if
+  repeat with targetWindow in windows
+    repeat with i from 1 to (count tabs of targetWindow)
+      try
+        if tty of tab i of targetWindow is targetTty then
+          return (id of targetWindow as text) & ":" & (i as text)
+        end if
+      end try
+    end repeat
   end repeat
-  return (targetWindowId as text) & ":" & (targetTabIndex as text)
 end tell
+return ""
 EOF
 }
 
@@ -303,6 +311,11 @@ if [[ ! -f "$WATCHER_SCRIPT" ]]; then
   exit 1
 fi
 
+if [[ -z "$SCRIPT_TTY" ]]; then
+  log "当前会话没有可识别的 TTY。请直接在 macOS Terminal 的交互式标签页里运行本脚本。"
+  exit 1
+fi
+
 if ! command -v python3 >/dev/null 2>&1; then
   log "未找到 python3，无法启动完成检测器。"
   exit 1
@@ -325,8 +338,10 @@ trap 'final_cleanup' EXIT
 
 log "webnovel 自动重启 wrapper 已启动"
 log "当前小说目录: $PROJECT_ROOT"
+log "当前终端 TTY: $SCRIPT_TTY"
 log "wrapper PID: $WRAPPER_PID"
 log "停止文件: $STOP_FILE"
+log "日志文件: $LOG_FILE"
 log "说明: 只会在 /webnovel-write 成功完成并额外等待 ${COOLDOWN_SECONDS} 秒后重启。"
 log "说明: 成功前手动 /exit 或任务失败，不会自动重启。"
 log "说明: 每轮 Claude 启动后会自动发送: ${AUTO_COMMAND}"
@@ -345,6 +360,7 @@ while true; do
   CURRENT_PIDFILE="$(mktemp "/tmp/webnovel_auto_reset.${WRAPPER_PID}.round${ROUND}.pid.XXXXXX")"
   CURRENT_REASON_FILE="${CURRENT_PIDFILE}.reason"
 
+  WEBNOVEL_AUTO_RESET_LOG_FILE="$LOG_FILE" \
   python3 "$WATCHER_SCRIPT" \
     --project-root "$PROJECT_ROOT" \
     --claude-pid-file "$CURRENT_PIDFILE" \

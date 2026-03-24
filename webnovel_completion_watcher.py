@@ -25,6 +25,14 @@ STATE_COOLDOWN = "cooldown"
 
 
 def log(message: str) -> None:
+    log_file = os.environ.get("WEBNOVEL_AUTO_RESET_LOG_FILE")
+    if log_file:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(log_file, "a", encoding="utf-8") as fh:
+                fh.write(f"[{timestamp}] [watcher] {message}\n")
+        except OSError:
+            pass
     print(message, file=sys.stderr, flush=True)
 
 
