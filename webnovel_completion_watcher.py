@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--claude-pid-file", required=True, help="当前 Claude PID 文件")
     parser.add_argument("--wrapper-pid", required=True, type=int, help="wrapper PID")
     parser.add_argument("--reason-file", required=True, help="结果原因文件")
+    parser.add_argument("--tracking-file", required=True, help="任务已启动标记文件")
     parser.add_argument("--stop-file", required=True, help="停止文件路径")
     parser.add_argument("--poll-interval", type=float, default=2.0, help="轮询间隔秒数")
     parser.add_argument("--cooldown-seconds", type=float, default=60.0, help="成功后保底等待秒数")
@@ -215,6 +216,7 @@ class CompletionWatcher:
         self.project_root = Path(args.project_root).resolve()
         self.pid_file = Path(args.claude_pid_file)
         self.reason_file = Path(args.reason_file)
+        self.tracking_file = Path(args.tracking_file)
         self.stop_file = Path(args.stop_file)
         self.workflow_state_path = self.project_root / ".webnovel" / "workflow_state.json"
         self.call_trace_path = self.project_root / ".webnovel" / "observability" / "call_trace.jsonl"
@@ -266,6 +268,10 @@ class CompletionWatcher:
             self.state.phase = STATE_TRACKING
             self.state.tracked_chapter = chapter_num
             self.state.task_started_ts = started_ts or time.time()
+            try:
+                self.tracking_file.write_text(f"{chapter_num}\n", encoding="utf-8")
+            except OSError:
+                pass
             if source == "workflow_state_existing":
                 log(f"检测到已有运行中的 /webnovel-write {chapter_num}，开始接管监听完成信号。")
             else:

@@ -45,6 +45,8 @@ COOLDOWN_SECONDS="${WEBNOVEL_AUTO_RESET_COOLDOWN_SECONDS:-60}"
 CLAUDE_CMD="${WEBNOVEL_AUTO_RESET_CLAUDE_CMD:-claude}"
 AUTO_COMMAND="${WEBNOVEL_AUTO_RESET_AUTO_COMMAND:-/webnovel-write}"
 AUTO_COMMAND_DELAY_SECONDS="${WEBNOVEL_AUTO_RESET_AUTO_COMMAND_DELAY_SECONDS:-1}"
+AUTO_COMMAND_START_GRACE_SECONDS="${WEBNOVEL_AUTO_RESET_AUTO_COMMAND_START_GRACE_SECONDS:-120}"
+AUTO_COMMAND_MAX_ATTEMPTS="${WEBNOVEL_AUTO_RESET_AUTO_COMMAND_MAX_ATTEMPTS:-2}"
 AUTO_COMMAND_PICK_DELAY_SECONDS="${WEBNOVEL_AUTO_RESET_AUTO_COMMAND_PICK_DELAY_SECONDS:-0.5}"
 AUTO_COMMAND_CONFIRM_DELAY_SECONDS="${WEBNOVEL_AUTO_RESET_AUTO_COMMAND_CONFIRM_DELAY_SECONDS:-1.2}"
 AUTO_COMMAND_FOCUS_DELAY_SECONDS="${WEBNOVEL_AUTO_RESET_AUTO_COMMAND_FOCUS_DELAY_SECONDS:-0.2}"
@@ -60,6 +62,7 @@ CURRENT_REASON_FILE=""
 CURRENT_WATCHER_PID=""
 CURRENT_AUTOTYPE_PID=""
 CURRENT_AUTOTYPE_STATUS_FILE=""
+CURRENT_TRACKING_FILE=""
 
 log() {
   local message="$*"
@@ -136,6 +139,12 @@ cleanup_round() {
   fi
 
   CURRENT_PIDFILE=""
+
+  if [[ -n "${CURRENT_TRACKING_FILE:-}" && -e "$CURRENT_TRACKING_FILE" ]]; then
+    rm -f "$CURRENT_TRACKING_FILE"
+  fi
+
+  CURRENT_TRACKING_FILE=""
 }
 
 capture_terminal_target() {
@@ -192,6 +201,9 @@ schedule_auto_command() {
   local terminal_target=""
   local terminal_window_id=""
   local terminal_tab_index=""
+  local round_snapshot="$ROUND"
+  local tracking_file_snapshot="${CURRENT_TRACKING_FILE:-}"
+  local pidfile_snapshot="${CURRENT_PIDFILE:-}"
 
   CURRENT_AUTOTYPE_STATUS_FILE=""
   CURRENT_AUTOTYPE_PID=""
@@ -210,16 +222,17 @@ schedule_auto_command() {
 
   (
     local autotype_result="failed"
-    acquire_autotype_lock
-    trap 'release_autotype_lock' EXIT
-    sleep "$AUTO_COMMAND_DELAY_SECONDS"
-    TERMINAL_WINDOW_ID_VALUE="$terminal_window_id" \
-    TERMINAL_TAB_INDEX_VALUE="$terminal_tab_index" \
-    AUTO_COMMAND_VALUE="$AUTO_COMMAND" \
-    AUTO_COMMAND_FOCUS_DELAY_VALUE="$AUTO_COMMAND_FOCUS_DELAY_SECONDS" \
-    AUTO_COMMAND_PICK_DELAY_VALUE="$AUTO_COMMAND_PICK_DELAY_SECONDS" \
-    AUTO_COMMAND_CONFIRM_DELAY_VALUE="$AUTO_COMMAND_CONFIRM_DELAY_SECONDS" \
-    osascript <<'EOF' >/dev/null 2>&1
+    local child_pid=""
+    local attempt=1
+    local wait_index=0
+    send_auto_command_once() {
+      TERMINAL_WINDOW_ID_VALUE="$terminal_window_id" \
+      TERMINAL_TAB_INDEX_VALUE="$terminal_tab_index" \
+      AUTO_COMMAND_VALUE="$AUTO_COMMAND" \
+      AUTO_COMMAND_FOCUS_DELAY_VALUE="$AUTO_COMMAND_FOCUS_DELAY_SECONDS" \
+      AUTO_COMMAND_PICK_DELAY_VALUE="$AUTO_COMMAND_PICK_DELAY_SECONDS" \
+      AUTO_COMMAND_CONFIRM_DELAY_VALUE="$AUTO_COMMAND_CONFIRM_DELAY_SECONDS" \
+      osascript <<'EOF' >/dev/null 2>&1
 set terminalWindowId to (system attribute "TERMINAL_WINDOW_ID_VALUE") as integer
 set terminalTabIndex to (system attribute "TERMINAL_TAB_INDEX_VALUE") as integer
 set autoCommand to system attribute "AUTO_COMMAND_VALUE"
@@ -258,13 +271,59 @@ if originalClipboard is not missing value then
   end try
 end if
 EOF
-    if [[ $? -eq 0 ]]; then
-      autotype_result="success"
-    fi
+    }
 
-    if [[ -n "$CURRENT_AUTOTYPE_STATUS_FILE" ]]; then
-      print -r -- "$autotype_result" > "$CURRENT_AUTOTYPE_STATUS_FILE"
-    fi
+    acquire_autotype_lock
+    trap 'release_autotype_lock' EXIT
+    while (( attempt <= AUTO_COMMAND_MAX_ATTEMPTS )); do
+      sleep "$AUTO_COMMAND_DELAY_SECONDS"
+      if send_auto_command_once; then
+        autotype_result="success"
+        if (( attempt == 1 )); then
+          log "第 ${round_snapshot} 轮已发送 ${AUTO_COMMAND} 自动输入，等待 Claude 真正开始任务。"
+        else
+          log "第 ${round_snapshot} 轮已第 ${attempt} 次发送 ${AUTO_COMMAND}，等待 Claude 真正开始任务。"
+        fi
+      else
+        log "第 ${round_snapshot} 轮第 ${attempt} 次自动输入发送失败，Claude 可能不会开始任务。"
+      fi
+
+      if [[ -n "$CURRENT_AUTOTYPE_STATUS_FILE" ]]; then
+        print -r -- "$autotype_result" > "$CURRENT_AUTOTYPE_STATUS_FILE"
+      fi
+
+      wait_index=0
+      while (( wait_index < AUTO_COMMAND_START_GRACE_SECONDS * 10 )); do
+        if [[ -n "$tracking_file_snapshot" && -e "$tracking_file_snapshot" ]]; then
+          exit 0
+        fi
+        if [[ -e "$STOP_FILE" ]]; then
+          exit 0
+        fi
+        child_pid="$(read_pidfile "$pidfile_snapshot")"
+        if [[ -n "$child_pid" ]] && ! is_alive "$child_pid"; then
+          exit 0
+        fi
+        sleep 0.1
+        (( wait_index += 1 ))
+      done
+
+      if [[ -n "$tracking_file_snapshot" && -e "$tracking_file_snapshot" ]]; then
+        exit 0
+      fi
+
+      if (( attempt < AUTO_COMMAND_MAX_ATTEMPTS )); then
+        log "第 ${round_snapshot} 轮在 ${AUTO_COMMAND_START_GRACE_SECONDS} 秒内仍未检测到 Claude 真正开始任务，准备再次发送 ${AUTO_COMMAND}。"
+      else
+        log "第 ${round_snapshot} 轮多次发送 ${AUTO_COMMAND} 后，仍未检测到 Claude 真正开始任务。将结束当前会话，避免一直卡住。"
+        child_pid="$(read_pidfile "$pidfile_snapshot")"
+        if [[ -n "$child_pid" ]]; then
+          terminate_target "$child_pid"
+        fi
+      fi
+
+      (( attempt += 1 ))
+    done
   ) &
 
   CURRENT_AUTOTYPE_PID=$!
@@ -359,6 +418,7 @@ while true; do
 
   CURRENT_PIDFILE="$(mktemp "/tmp/webnovel_auto_reset.${WRAPPER_PID}.round${ROUND}.pid.XXXXXX")"
   CURRENT_REASON_FILE="${CURRENT_PIDFILE}.reason"
+  CURRENT_TRACKING_FILE="${CURRENT_PIDFILE}.tracking"
 
   WEBNOVEL_AUTO_RESET_LOG_FILE="$LOG_FILE" \
   python3 "$WATCHER_SCRIPT" \
@@ -366,6 +426,7 @@ while true; do
     --claude-pid-file "$CURRENT_PIDFILE" \
     --wrapper-pid "$WRAPPER_PID" \
     --reason-file "$CURRENT_REASON_FILE" \
+    --tracking-file "$CURRENT_TRACKING_FILE" \
     --stop-file "$STOP_FILE" \
     --poll-interval "$POLL_INTERVAL_SECONDS" \
     --cooldown-seconds "$COOLDOWN_SECONDS" &
@@ -432,6 +493,8 @@ while true; do
       log "第 ${ROUND} 轮未检测到新的 /webnovel-write，wrapper 自动停止。"
       if [[ "$autotype_status" == "failed" ]]; then
         log "自动输入 /webnovel-write 失败。请到“系统设置 -> 隐私与安全性 -> 辅助功能”里确认 Terminal 和 System Events 已获授权。"
+      elif [[ "$autotype_status" == "success" ]]; then
+        log "自动输入 /webnovel-write 已发送，但未检测到 Claude 真正开始任务。通常表示命令停在输入框或斜杠菜单，尚未实际执行。"
       fi
       break
       ;;
