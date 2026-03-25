@@ -421,18 +421,22 @@ while true; do
       (( ROUND += 1 ))
       ;;
     failed)
+      log "第 ${ROUND} 轮检测到 /webnovel-write 执行失败，wrapper 自动停止。"
       break
       ;;
     manual_exit)
+      log "第 ${ROUND} 轮在成功完成前检测到 Claude 已退出，wrapper 自动停止。"
       break
       ;;
     no_tracked_task)
+      log "第 ${ROUND} 轮未检测到新的 /webnovel-write，wrapper 自动停止。"
       if [[ "$autotype_status" == "failed" ]]; then
         log "自动输入 /webnovel-write 失败。请到“系统设置 -> 隐私与安全性 -> 辅助功能”里确认 Terminal 和 System Events 已获授权。"
       fi
       break
       ;;
     stopped)
+      log "第 ${ROUND} 轮检测到停止请求，wrapper 自动停止。"
       break
       ;;
     "")
